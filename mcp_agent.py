@@ -5,6 +5,15 @@ Lab 3: Agent with FastMCP Weather Server
 A TRUE agentic implementation where the LLM dynamically selects which
 tools to call and when to stop. This demonstrates:
 
+* **LLM-Driven Control Flow**: Agent loop runs until LLM says "DONE"
+* **Dynamic Tool Selection**: LLM chooses which MCP tool to invoke each step
+* **Flexible Reasoning**: Can handle queries requiring different tool sequences
+* **TAO Protocol**: Full thought/action/observation trace with real agent behavior
+
+Example Flows:
+1. Standard: geocode → get_weather → convert_c_to_f → DONE
+2. With coords: get_weather → convert_c_to_f → DONE (skip geocode)
+3. Celsius OK: geocode → get_weather → DONE (skip conversion)
 
 Prerequisites: FastMCP weather server must be running on localhost:8000
 """
@@ -19,13 +28,74 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from langchain_ollama import ChatOllama
 
-# Instead of hardcoding tool definitions, we discover them from the
-# MCP server at runtime and inject them into this template.
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║ 1.  System prompt TEMPLATE — tool definitions come from MCP      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Instead of hardcoding tool definitions here, we discover them from
+# the MCP server at runtime and inject them into this template.
 SYSTEM_TEMPLATE = textwrap.dedent("""
 You are a weather information agent with access to these tools
 (discovered from the MCP server at runtime):
 
+{mcp_tool_descriptions}
+
+IMPORTANT: When you have enough information to answer the user's question,
+respond with:
+Thought: I have all the information needed
+Action: DONE
+Args: {{}}
+
+For each step where you need to call a tool, respond with EXACTLY three lines:
+
+Thought: <your reasoning about what to do next>
+Action: <exact tool name, or DONE>
+Args: <valid JSON arguments for the tool>
+
+Examples:
+Thought: I need to find the coordinates for Paris first
+Action: geocode_location
+Args: {{"name": "Paris"}}
+
+Thought: Now I'll get the weather at those coordinates
+Action: get_weather
+Args: {{"lat": 48.8566, "lon": 2.3522}}
+
+Thought: I need to convert 20.5 Celsius to Fahrenheit
+Action: convert_c_to_f
+Args: {{"c": 20.5}}
+
+Do NOT add extra text. Do NOT explain after your three lines.
 """).strip()
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║ 1b. Helper: format MCP tool schemas for the system prompt        ║
+# ╚══════════════════════════════════════════════════════════════════╝
+def format_mcp_tools(tools) -> str:
+    """Build a human-readable tool catalogue from MCP tool metadata.
+
+    Called after mcp.list_tools() so the agent's prompt always
+    reflects whatever the server *actually* exposes — no hard-coding.
+
+    NOTE: The same MCP tool schemas can also be used with LangChain's
+    bind_tools() for structured tool calling:
+        lc_tools = [... convert MCP schemas to LangChain format ...]
+        llm_with_tools = llm.bind_tools(lc_tools)
+    """
+    lines = []
+    for t in tools:
+        # Build a parameter signature from the tool's JSON Schema
+        schema = t.inputSchema or {}
+        props = schema.get("properties", {})
+        params = ", ".join(
+            f"{name}: {info.get('type', 'any')}" for name, info in props.items()
+        )
+        lines.append(f"{t.name}({params})")
+        # Use the first line of the MCP-provided description
+        if t.description:
+            first_line = t.description.strip().split("\n")[0].strip()
+            lines.append(f"    {first_line}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 # Regex patterns for parsing LLM responses
 ACTION_RE = re.compile(r"Action:\s*(\w+)", re.IGNORECASE)
@@ -77,20 +147,61 @@ def extract_city(prompt: str) -> Optional[str]:
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║ 4.  Dynamic TAO loop with LLM-controlled tool selection          ║
 # ╚══════════════════════════════════════════════════════════════════╝
+async def run_dynamic(city: str, max_steps: int = 10) -> None:
+    """
+    Run a dynamic TAO agent loop where the LLM decides which tools to call.
+
+    Args:
+        city: The city to query about
+        max_steps: Maximum number of tool calls to prevent infinite loops
+    """
     llm = ChatOllama(model="llama3.2", temperature=0.0)
 
     async with Client("http://127.0.0.1:8000/mcp/") as mcp:
-        # TODO: Discover tools from MCP server using mcp.list_tools()
-        #       and build system_prompt from SYSTEM_TEMPLATE
+        # ── Discover available tools from the MCP server ───────────
+        # This is the proper MCP approach: the server tells us what
+        # tools it has, rather than the client hardcoding them.
+        mcp_tools = await mcp.list_tools()
+        tool_descriptions = format_mcp_tools(mcp_tools)
+        system_prompt = SYSTEM_TEMPLATE.format(
+            mcp_tool_descriptions=tool_descriptions
+        )
+
         messages = [
-            {"role": "system", "content": SYSTEM_TEMPLATE},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"What is the current weather in {city}?"},
         ]
 
+        print("\n" + "="*60)
+        print("Dynamic TAO Agent - LLM Controls Tool Selection")
+        print("="*60)
+        print(f"\nDiscovered {len(mcp_tools)} tools from MCP server:")
+        for t in mcp_tools:
+            print(f"  - {t.name}")
+        print()
+
+        # Store context for final answer
+        context = {
+            "city": city,
+            "latitude": None,
+            "longitude": None,
+            "temperature_c": None,
+            "temperature_f": None,
+            "conditions": None,
+        }
 
         for step in range(1, max_steps + 1):
             print(f"[Step {step}]")
-            
+
+            # Get LLM's decision
+            response = llm.invoke(messages).content.strip()
+            print(response)
+
+            # Parse the action
+            action_match = ACTION_RE.search(response)
+            if not action_match:
+                print("\n❌ Error: Could not parse Action from LLM response")
+                return
 
             action = action_match.group(1).lower()
 
@@ -126,7 +237,11 @@ def extract_city(prompt: str) -> Optional[str]:
                 print(f"\n❌ Error: Invalid JSON in Args: {e}")
                 return
 
+            # Dynamically call the tool the LLM selected
+            print(f"\n→ Calling MCP tool: {action}({json.dumps(args)})")
 
+            try:
+                result = unwrap(await mcp.call_tool(action, args))
             except ToolError as e:
                 print(f"❌ MCP Error: {e}\n")
                 # Add error to conversation and let LLM try to recover
@@ -153,7 +268,17 @@ def extract_city(prompt: str) -> Optional[str]:
                 context["temperature_c"] = result.get("temperature")
                 context["conditions"] = result.get("conditions")
             elif action == "convert_c_to_f":
-                context["temperature_f"] = float(result)           
+                context["temperature_f"] = float(result)
+
+            # Show observation
+            observation = f"Observation: {json.dumps(result) if isinstance(result, dict) else result}"
+            print(observation)
+            print()
+
+            # Add to conversation history
+            messages.append({"role": "assistant", "content": response})
+            messages.append({"role": "user", "content": observation})
+
         # Max steps reached
         print(f"\n⚠️  Reached maximum steps ({max_steps}) without completion")
         print("Partial information gathered:")

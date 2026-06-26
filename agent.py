@@ -27,42 +27,117 @@ WEATHER_CODES = {
 
 # ── 2. Tools ───────────────────────────────────────────────────────────────
 def get_weather(lat: float, lon: float) -> dict:
-
+    """
+    Return today's forecast:
+        { "high": °C, "low": °C, "conditions": str }
+    """
+    today = date.today().isoformat()
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+        f"&start_date={today}&end_date={today}"
+        "&timezone=auto"
+    )
 
     # Retry up to 3 times
     max_retries = 3
     for attempt in range(max_retries):
         try:
-
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            daily = r.json()["daily"]
+            return {
+                "high":       daily["temperature_2m_max"][0],
+                "low":        daily["temperature_2m_min"][0],
+                "conditions": WEATHER_CODES.get(daily["weather_code"][0], "Unknown"),
+            }
         except (requests.Timeout, requests.ConnectionError) as e:
             if attempt == max_retries - 1:
                 raise  # Re-raise on final attempt
             print(f"  ⚠️  Retry {attempt + 1}/{max_retries - 1} after timeout...")
             time.sleep(2)  # Wait 2 seconds before retrying
 
-# TODO: Add convert_c_to_f tool
+def convert_c_to_f(c: float) -> dict:
+    """Convert a Celsius temperature to Fahrenheit."""
+    return {"fahrenheit": round(c * 9/5 + 32, 1)}
 
 # ── 3. Tool registry ────────────────────────────────────────────────────────
-
+TOOLS = {
+    "get_weather": get_weather,
+    "convert_c_to_f": convert_c_to_f,
+}
 
 # ── 4. LLM client ───────────────────────────────────────────────────────────
-
+llm = ChatOllama(model="llama3.2", temperature=0.0)
 
 # ── 5. System prompt ────────────────────────────────────────────────────────
 SYSTEM = textwrap.dedent("""
+You are a weather agent with two tools:
 
+get_weather(lat:float, lon:float)
+    → {"high": float, "low": float, "conditions": str}
+    Returns today's weather forecast. Temperatures are in Celsius.
+
+convert_c_to_f(c:float)
+    → {"fahrenheit": float}
+    Converts a Celsius temperature to Fahrenheit.
+
+WORKFLOW — always follow these steps in order:
+1. Call get_weather to get the forecast (returns Celsius)
+2. Call convert_c_to_f to convert the high temperature to Fahrenheit
+3. Give your Final answer with the temperature in Fahrenheit
+
+For each tool call, output EXACTLY:
+Thought: <reasoning>
+Action: <tool_name>
+Args: <JSON arguments>
+
+When done, output EXACTLY:
+Thought: <reasoning>
+Final: <natural language answer>
+
+FULL EXAMPLE:
+
+Thought: I need to get weather for London at 51.5074, -0.1278
+Action: get_weather
+Args: {"lat": 51.5074, "lon": -0.1278}
+
+Thought: High is 18.5°C. I must convert to Fahrenheit using convert_c_to_f.
+Action: convert_c_to_f
+Args: {"c": 18.5}
+
+Thought: High is 65.3°F. I can give my final answer now.
+Final: Today in London will be Partly cloudy with a high of 65.3°F.
+
+RULES:
+1. Every response MUST start with "Thought:"
+2. ALWAYS call convert_c_to_f before your Final — never skip it
+3. NEVER report Celsius in your Final answer
+4. NEVER do math yourself — always use the convert_c_to_f tool
+5. After Action/Args, STOP and wait for the Observation
+6. NEVER output more than one Thought/Action/Args block per response
+7. NEVER invent or guess temperatures — only use values from Observations
+8. NEVER output a Final answer until you have received Observations from both tools
 """).strip()
 
 # ── 6. TAO run helper ───────────────────────────────────────────────────────
 def run(question: str) -> str:
-   
+    """Execute the TAO loop, letting the AI decide which tools to call."""
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user",   "content": question},
+    ]
 
     print("\n--- Thought → Action → Observation loop ---\n")
 
     tools_called = set()       # Track which tools the agent has used
     max_iterations = 6         # Allow enough steps for multi-tool flow
     for i in range(max_iterations):
-
+        # Get AI's next step
+        reply = llm.invoke(messages)
+        response = reply.content.strip()
+        print(response + "\n")
 
         # Check if AI is done
         if "Final:" in response:
@@ -73,8 +148,12 @@ def run(question: str) -> str:
         if "Action:" in response and "Args:" in response:
             try:
                 # Extract action and args
- 
+                action_line = response.split("Action:")[1].split("\n")[0].strip()
+                args_text = response.split("Args:")[1].split("\n")[0].strip()
+
                 # Get the tool function
+                tool_name = action_line
+                tool_func = TOOLS.get(tool_name)
 
                 if tool_func is None:
                     print(f"⚠️  Unknown tool: '{tool_name}'\n")
@@ -82,11 +161,14 @@ def run(question: str) -> str:
                     break
 
                 # Parse arguments and call the tool
-
+                args = json.loads(args_text)
+                observation = tool_func(**args)
+                tools_called.add(tool_name)
                 print(f"Observation: {observation}\n")
 
                 # Add to conversation history
-
+                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "user", "content": f"Observation: {observation}"})
             except json.JSONDecodeError as e:
                 print(f"⚠️  Failed to parse Args as JSON: {e}\n")
                 print(f"Args text was: {args_text}\n")
@@ -119,6 +201,4 @@ if __name__ == "__main__":
             print(f"\n✓ {answer}\n")
         except Exception as e:
             print(f"⚠️  Error: {e}\n")
-
-
 
